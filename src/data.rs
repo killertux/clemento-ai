@@ -66,12 +66,6 @@ impl Corpus {
         h as f32
     }
 
-    /// Iterate non-overlapping windows of `window + 1` ids. Each window is an
-    /// input sequence of length `window` plus one look-ahead target, so
-    /// `window[t]` predicts `window[t + 1]`.
-    pub fn windows(&self, window: usize) -> impl Iterator<Item = &[u32]> {
-        self.tokens.chunks_exact(window + 1)
-    }
 }
 
 #[cfg(test)]

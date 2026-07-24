@@ -52,6 +52,9 @@ enum Command {
         /// Write a checkpoint every N steps (0 disables periodic checkpoints).
         #[arg(long = "ckpt-every", default_value_t = 1000)]
         ckpt_every: usize,
+        /// Fraction of the corpus held out (from the end) for validation.
+        #[arg(long = "val-frac", default_value_t = 0.1)]
+        val_frac: f32,
 
         /// Number of neurons.
         #[arg(long)]
@@ -102,6 +105,7 @@ fn main() {
             steps,
             log_every,
             ckpt_every,
+            val_frac,
             n,
             k,
             window,
@@ -137,6 +141,7 @@ fn main() {
                 steps,
                 log_every,
                 checkpoint_every: ckpt_every,
+                val_frac,
             };
             train::train(cfg, &opts)
         }

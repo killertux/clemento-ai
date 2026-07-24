@@ -36,6 +36,26 @@ pub struct TrainOpts {
     pub steps: usize,
     pub log_every: usize,
     pub checkpoint_every: usize,
+    /// Fraction of the corpus held out (from the end) for validation.
+    pub val_frac: f32,
+}
+
+/// Mean cross-entropy over held-out windows (forward only, no gradients). State
+/// is carried across contiguous windows and reset at the start. Capped at
+/// `max_windows` windows to keep evaluation cheap on large validation sets.
+fn eval_loss(net: &Network, windows: &[&[u32]], max_windows: usize) -> Option<f32> {
+    if windows.is_empty() {
+        return None;
+    }
+    let count = windows.len().min(max_windows);
+    let mut state = vec![0.0f32; net.cfg.n];
+    let mut acc = 0.0f32;
+    for w in windows.iter().take(count) {
+        let tape = net.run_window(w, &state);
+        acc += tape.loss;
+        state = tape.state.last().unwrap().clone();
+    }
+    Some(acc / count as f32)
 }
 
 pub fn train(mut cfg: Config, opts: &TrainOpts) -> std::io::Result<()> {
@@ -58,11 +78,25 @@ pub fn train(mut cfg: Config, opts: &TrainOpts) -> std::io::Result<()> {
     let mut mom = Moments::new(&net);
     let mut adam = Adam::new(&cfg);
 
-    let windows: Vec<&[u32]> = corpus.windows(cfg.window).collect();
+    // Split off the tail of the corpus for validation. The train/val boundary
+    // is a single contiguous cut, so no window straddles both sets.
+    let val_frac = opts.val_frac.clamp(0.0, 0.9);
+    let cut = ((corpus.tokens.len() as f32) * (1.0 - val_frac)) as usize;
+    let (train_tokens, val_tokens) = corpus.tokens.split_at(cut);
+    let windows: Vec<&[u32]> = train_tokens.chunks_exact(cfg.window + 1).collect();
+    let val_windows: Vec<&[u32]> = val_tokens.chunks_exact(cfg.window + 1).collect();
     if windows.is_empty() {
         panic!("corpus too small for window {}", cfg.window);
     }
-    println!("{} training windows of length {}", windows.len(), cfg.window + 1);
+    println!(
+        "{} train / {} val windows of length {}",
+        windows.len(),
+        val_windows.len(),
+        cfg.window + 1
+    );
+    if val_windows.is_empty() && val_frac > 0.0 {
+        println!("  (warning: validation split too small for one window; val loss disabled)");
+    }
 
     let mut state = vec![0.0f32; cfg.n];
     let mut loss_acc = 0.0f32;
@@ -101,8 +135,13 @@ pub fn train(mut cfg: Config, opts: &TrainOpts) -> std::io::Result<()> {
         logged += 1;
         if step % opts.log_every == 0 && step > 0 {
             let avg_loss = loss_acc / logged as f32;
+            let val = eval_loss(&net, &val_windows, 128);
+            let val_str = match val {
+                Some(v) => format!("val {v:.4}"),
+                None => "val n/a".to_string(),
+            };
             println!(
-                "step {step:>7}  loss {avg_loss:.4} nats  (baseline {baseline:.4})  active {:.1}%",
+                "step {step:>7}  train {avg_loss:.4}  {val_str}  (baseline {baseline:.4})  active {:.1}%",
                 100.0 * active_acc / logged as f32
             );
             loss_acc = 0.0;
