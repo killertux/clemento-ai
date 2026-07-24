@@ -74,6 +74,24 @@ enum Command {
         /// Enable RigL topology learning (prune/grow).
         #[arg(long)]
         rigl: bool,
+
+        /// Gate firing threshold. Lower = more neurons fire (higher active%,
+        /// more capacity); higher = sparser activity.
+        #[arg(long)]
+        theta: Option<f32>,
+        /// Gate steepness (surrogate-gradient sharpness).
+        #[arg(long)]
+        beta: Option<f32>,
+        /// Target spectral radius. Closer to 1.0 = activity/memory persists
+        /// longer across steps; lower = signal decays faster.
+        #[arg(long = "spectral-radius")]
+        spectral_radius: Option<f32>,
+        /// Number of input neurons (token-embedding fan-in).
+        #[arg(long = "n-in")]
+        n_in: Option<usize>,
+        /// Number of output neurons the readout sees.
+        #[arg(long = "n-out")]
+        n_out: Option<usize>,
     },
     /// Generate text from a trained model.
     Generate {
@@ -112,6 +130,11 @@ fn main() {
             lr,
             seed,
             rigl,
+            theta,
+            beta,
+            spectral_radius,
+            n_in,
+            n_out,
         } => {
             let mut cfg = Config::default();
             if let Some(v) = n {
@@ -129,11 +152,26 @@ fn main() {
             if let Some(v) = seed {
                 cfg.seed = v;
             }
+            if let Some(v) = theta {
+                cfg.theta = v;
+            }
+            if let Some(v) = beta {
+                cfg.beta = v;
+            }
+            if let Some(v) = spectral_radius {
+                cfg.spectral_radius = v;
+            }
+            if let Some(v) = n_in {
+                cfg.n_in = v;
+            }
+            if let Some(v) = n_out {
+                cfg.n_out = v;
+            }
             cfg.rigl_enabled = rigl;
 
             println!(
-                "config: n={} k={} window={} lr={} rigl={}",
-                cfg.n, cfg.k, cfg.window, cfg.lr, cfg.rigl_enabled
+                "config: n={} k={} window={} lr={} theta={} rho={} n_in={} n_out={} rigl={}",
+                cfg.n, cfg.k, cfg.window, cfg.lr, cfg.theta, cfg.spectral_radius, cfg.n_in, cfg.n_out, cfg.rigl_enabled
             );
             let opts = TrainOpts {
                 corpus_path: data,
