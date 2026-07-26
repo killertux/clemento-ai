@@ -7,6 +7,8 @@ edition = "2024"
 rand = "0.8"
 rayon = "1"
 clap = { version = "4", features = ["derive"] }
+ndarray = "0.17.2"
+itertools = "0.15.0"
 
 [profile.release]
 opt-level = 3

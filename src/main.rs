@@ -1,209 +1,179 @@
-//! clemento-ai — a free-topology recurrent neural network (see README.md).
+use itertools::Itertools;
+use rand::random;
+use std::{
+    f32,
+    ops::{Add, SubAssign},
+};
 
-mod backprop;
-mod checkpoint;
-mod config;
-mod data;
-mod graph;
-mod network;
-mod optim;
-mod rigl;
-mod train;
+use ndarray::{Array1, Array2, Axis, Ix2, arr1, arr2};
 
-use clap::{Parser, Subcommand};
-
-use config::Config;
-use data::Corpus;
-use train::{GenOpts, TrainOpts};
-
-#[derive(Parser)]
-#[command(
-    name = "clemento-ai",
-    about = "Free-topology recurrent neural network",
-    version
-)]
-struct Cli {
-    #[command(subcommand)]
-    command: Command,
+pub struct Mlp {
+    weights: Vec<Array2<f32>>,
+    biases: Vec<Array1<f32>>,
 }
 
-#[derive(Subcommand)]
-enum Command {
-    /// Inspect a corpus and print the unigram baseline loss.
-    Stats {
-        /// Path to the text corpus.
-        #[arg(long, default_value = "data/input.txt")]
-        data: String,
-    },
-    /// Train the network on a corpus.
-    Train {
-        /// Path to the text corpus.
-        #[arg(long, default_value = "data/input.txt")]
-        data: String,
-        /// Where to write the trained model.
-        #[arg(long, default_value = "model.bin")]
-        out: String,
-        /// Number of training steps (windows).
-        #[arg(long, default_value_t = 10_000)]
-        steps: usize,
-        /// Log metrics every N steps.
-        #[arg(long = "log-every", default_value_t = 100)]
-        log_every: usize,
-        /// Write a checkpoint every N steps (0 disables periodic checkpoints).
-        #[arg(long = "ckpt-every", default_value_t = 1000)]
-        ckpt_every: usize,
-        /// Fraction of the corpus held out (from the end) for validation.
-        #[arg(long = "val-frac", default_value_t = 0.1)]
-        val_frac: f32,
+impl Mlp {
+    pub fn new(topology: &[usize]) -> Self {
+        topology.iter().tuple_windows().fold(
+            Self {
+                weights: Vec::new(),
+                biases: Vec::new(),
+            },
+            |mut acc, element: (&usize, &usize)| {
+                let mut value = Array2::zeros(Ix2(*element.0, *element.1));
+                value.iter_mut().for_each(|v| *v = random());
+                acc.weights.push(value);
+                let mut value = Array1::zeros(*element.1);
+                value.iter_mut().for_each(|v| *v = random());
+                acc.biases.push(value);
+                acc
+            },
+        )
+    }
 
-        /// Number of neurons.
-        #[arg(long)]
-        n: Option<usize>,
-        /// Out-edges per neuron.
-        #[arg(long)]
-        k: Option<usize>,
-        /// Truncated-BPTT window length.
-        #[arg(long)]
-        window: Option<usize>,
-        /// Adam learning rate.
-        #[arg(long)]
-        lr: Option<f32>,
-        /// PRNG seed.
-        #[arg(long)]
-        seed: Option<u64>,
-        /// Enable RigL topology learning (prune/grow).
-        #[arg(long)]
-        rigl: bool,
+    pub fn forward(&self, x: Array1<f32>) -> Array1<f32> {
+        self.weights
+            .iter()
+            .zip(self.biases.iter())
+            .fold(x, |acc, element| {
+                acc.dot(element.0)
+                    .add(element.1)
+                    .mapv(|v| 1.0 / (1.0 + (-v).exp()))
+            })
+    }
 
-        /// Gate firing threshold. Lower = more neurons fire (higher active%,
-        /// more capacity); higher = sparser activity.
-        #[arg(long)]
-        theta: Option<f32>,
-        /// Gate steepness (surrogate-gradient sharpness).
-        #[arg(long)]
-        beta: Option<f32>,
-        /// Target spectral radius. Closer to 1.0 = activity/memory persists
-        /// longer across steps; lower = signal decays faster.
-        #[arg(long = "spectral-radius")]
-        spectral_radius: Option<f32>,
-        /// Number of input neurons (token-embedding fan-in).
-        #[arg(long = "n-in")]
-        n_in: Option<usize>,
-        /// Number of output neurons the readout sees.
-        #[arg(long = "n-out")]
-        n_out: Option<usize>,
-    },
-    /// Generate text from a trained model.
-    Generate {
-        /// Path to the trained model.
-        #[arg(long, default_value = "model.bin")]
-        model: String,
-        /// Seed text to prime the network.
-        #[arg(long, default_value = "")]
-        prompt: String,
-        /// Number of characters to generate.
-        #[arg(long = "len", default_value_t = 500)]
-        length: usize,
-        /// Sampling temperature (0 = greedy).
-        #[arg(long = "temp", default_value_t = 0.8)]
-        temperature: f32,
-        /// PRNG seed for sampling.
-        #[arg(long, default_value_t = 1234)]
-        seed: u64,
-    },
-}
+    pub fn forward_with_cache(&self, x: Array1<f32>) -> Vec<Array1<f32>> {
+        self.weights
+            .iter()
+            .zip(self.biases.iter())
+            .fold(vec![x], |mut acc, element| {
+                let z = acc[acc.len() - 1]
+                    .dot(element.0)
+                    .add(element.1)
+                    .mapv(|v| 1.0 / (1.0 + (-v).exp()));
+                acc.push(z);
+                acc
+            })
+    }
 
-fn main() {
-    let cli = Cli::parse();
-    let result = match cli.command {
-        Command::Stats { data } => cmd_stats(&data),
-        Command::Train {
-            data,
-            out,
-            steps,
-            log_every,
-            ckpt_every,
-            val_frac,
-            n,
-            k,
-            window,
-            lr,
-            seed,
-            rigl,
-            theta,
-            beta,
-            spectral_radius,
-            n_in,
-            n_out,
-        } => {
-            let mut cfg = Config::default();
-            if let Some(v) = n {
-                cfg.n = v;
-            }
-            if let Some(v) = k {
-                cfg.k = v;
-            }
-            if let Some(v) = window {
-                cfg.window = v;
-            }
-            if let Some(v) = lr {
-                cfg.lr = v;
-            }
-            if let Some(v) = seed {
-                cfg.seed = v;
-            }
-            if let Some(v) = theta {
-                cfg.theta = v;
-            }
-            if let Some(v) = beta {
-                cfg.beta = v;
-            }
-            if let Some(v) = spectral_radius {
-                cfg.spectral_radius = v;
-            }
-            if let Some(v) = n_in {
-                cfg.n_in = v;
-            }
-            if let Some(v) = n_out {
-                cfg.n_out = v;
-            }
-            cfg.rigl_enabled = rigl;
+    pub fn backpropagate(
+        &self,
+        x: Array1<f32>,
+        target: Array1<f32>,
+    ) -> (Vec<Array2<f32>>, Vec<Array1<f32>>) {
+        let cache = self.forward_with_cache(x);
+        let l = self.weights.len();
 
-            println!(
-                "config: n={} k={} window={} lr={} theta={} rho={} n_in={} n_out={} rigl={}",
-                cfg.n, cfg.k, cfg.window, cfg.lr, cfg.theta, cfg.spectral_radius, cfg.n_in, cfg.n_out, cfg.rigl_enabled
-            );
-            let opts = TrainOpts {
-                corpus_path: data,
-                out_path: out,
-                steps,
-                log_every,
-                checkpoint_every: ckpt_every,
-                val_frac,
-            };
-            train::train(cfg, &opts)
+        let mut d_weights: Vec<Array2<f32>> = vec![Array2::zeros((0, 0)); l];
+        let mut d_biases: Vec<Array1<f32>> = vec![Array1::zeros(0); l];
+
+        let mut delta = &cache[l] - &target;
+
+        for layer in (0..l).rev() {
+            let a_prev = &cache[layer];
+
+            d_weights[layer] = a_prev
+                .view()
+                .insert_axis(Axis(1))
+                .dot(&delta.view().insert_axis(Axis(0)));
+            d_biases[layer] = delta.clone(); // ← dL/db = δ
+
+            if layer > 0 {
+                let routed = self.weights[layer].dot(&delta);
+                let slope = a_prev.mapv(|a| a * (1.0 - a));
+                delta = routed * slope;
+            }
         }
-        Command::Generate { model, prompt, length, temperature, seed } => {
-            let opts = GenOpts { ckpt_path: model, prompt, length, temperature, seed };
-            train::generate(&opts).map(|text| println!("{text}"))
-        }
-    };
-    if let Err(e) = result {
-        eprintln!("error: {e}");
-        std::process::exit(1);
+        (d_weights, d_biases)
+    }
+
+    pub fn train(&mut self, x: Array1<f32>, target: Array1<f32>, lr: f32) {
+        let (d_weights, d_biases) = self.backpropagate(x, target);
+        self.weights
+            .iter_mut()
+            .zip(d_weights.iter())
+            .for_each(|(weight, d_weight)| weight.sub_assign(&(d_weight * lr)));
+        self.biases
+            .iter_mut()
+            .zip(d_biases.iter())
+            .for_each(|(bias, d_bias)| bias.sub_assign(&(d_bias * lr)));
     }
 }
 
-fn cmd_stats(data: &str) -> std::io::Result<()> {
-    let corpus = Corpus::load(data)?;
-    let h = corpus.unigram_cross_entropy();
-    println!("file: {data}");
-    println!("tokens: {}", corpus.tokens.len());
-    println!("vocab size: {}", corpus.vocab_size());
-    println!(
-        "unigram cross-entropy: {:.4} nats ({:.4} bits/char)",
-        h,
-        h / std::f32::consts::LN_2
-    );
-    Ok(())
+static AND_X: [[f32; 2]; 4] = [[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]];
+static AND_Y: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
+static XOR_X: [[f32; 2]; 4] = [[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]];
+static XOR_Y: [f32; 4] = [0.0, 1.0, 1.0, 0.0];
+static OR_X: [[f32; 2]; 4] = [[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]];
+static OR_Y: [f32; 4] = [0.0, 1.0, 1.0, 1.0];
+static NAND_X: [[f32; 2]; 4] = [[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]];
+static NAND_Y: [f32; 4] = [1.0, 1.0, 1.0, 0.0];
+
+fn main() {
+    let mut mlp = Mlp::new(&[2, 2, 1]);
+    (0..20000).into_iter().for_each(|_| {
+        XOR_X
+            .iter()
+            .zip(XOR_Y.iter())
+            .for_each(|(x, t)| mlp.train(arr1(x), arr1(&[*t]), 0.1))
+    });
+
+    println!("x1|  x2|  y");
+    for x in XOR_X {
+        let y = mlp.forward(arr1(&x));
+        println!("{}|{}|{}", x[0], x[1], y[0])
+    }
+    // let mlp = MLP {
+    //     output: [Neuron {
+    //         weights: [10.67, 10.67],
+    //         bias: -16.1,
+    //     }],
+    //     hidden_layer: [[
+    //         Neuron {
+    //             weights: [11.9, 11.9],
+    //             bias: -5.5,
+    //         },
+    //         Neuron {
+    //             weights: [-10.6, -10.6],
+    //             bias: 16.1,
+    //         },
+    //     ]],
+    // };
+
+    // println!("x1   |x2    |y");
+    // let x = [0.0, 0.0];
+    // let y = mlp.forward(&x);
+    // println!("0.00 | 0.00 | {:.2}", y.0[0]);
+    // let x = [1.0, 0.0];
+    // let y = mlp.forward(&x);
+    // println!("1.00 | 0.00 | {:.2}", y.0[0]);
+    // let x = [0.0, 1.0];
+    // let y = mlp.forward(&x);
+    // println!("0.00 | 1.00 | {:.2}", y.0[0]);
+    // let x = [1.0, 1.0];
+    // let y = mlp.forward(&x);
+    // println!("1.00 | 1.00 | {:.2}", y.0[0]);
+
+    // let mut neuron = Neuron {
+    //     weights: [0.5, 0.5],
+    //     bias: 0.0,
+    // };
+    // let inputs = AND_X;
+    // let targets = AND_Y;
+
+    // let steps = 10000;
+    // let chunk = 500;
+    // for _ in 0..(steps / chunk) {
+    //     println!("Errors: {}", mean_square_error(&neuron, &inputs, &targets));
+    //     train(
+    //         &mut neuron,
+    //         &inputs,
+    //         &targets,
+    //         gradient_binary_cross_entry,
+    //         0.5,
+    //         chunk,
+    //     )
+    // }
+    // println!("Errors: {}", mean_square_error(&neuron, &inputs, &targets));
+    // println!("{:?}", neuron);
 }
